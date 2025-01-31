@@ -1,4 +1,6 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright (c) The OpenTofu Authors
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (c) 2023 HashiCorp, Inc.
 // SPDX-License-Identifier: MPL-2.0
 
 package s3
@@ -20,8 +22,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	awsbase "github.com/hashicorp/aws-sdk-go-base/v2"
 	baselogging "github.com/hashicorp/aws-sdk-go-base/v2/logging"
+	awsbaseValidation "github.com/hashicorp/aws-sdk-go-base/v2/validation"
 	"github.com/opentofu/opentofu/internal/backend"
 	"github.com/opentofu/opentofu/internal/configs/configschema"
+	"github.com/opentofu/opentofu/internal/encryption"
 	"github.com/opentofu/opentofu/internal/httpclient"
 	"github.com/opentofu/opentofu/internal/logging"
 	"github.com/opentofu/opentofu/internal/tfdiags"
@@ -30,14 +34,15 @@ import (
 	"github.com/zclconf/go-cty/cty/gocty"
 )
 
-func New() backend.Backend {
-	return &Backend{}
+func New(enc encryption.StateEncryption) backend.Backend {
+	return &Backend{encryption: enc}
 }
 
 type Backend struct {
-	s3Client  *s3.Client
-	dynClient *dynamodb.Client
-	awsConfig aws.Config
+	encryption encryption.StateEncryption
+	s3Client   *s3.Client
+	dynClient  *dynamodb.Client
+	awsConfig  aws.Config
 
 	bucketName            string
 	keyName               string
@@ -52,6 +57,7 @@ type Backend struct {
 
 // ConfigSchema returns a description of the expected configuration
 // structure for the receiving backend.
+// This structure is mirrored by the encryption aws_kms key provider and should be kept in sync.
 func (b *Backend) ConfigSchema() *configschema.Block {
 	return &configschema.Block{
 		Attributes: map[string]*configschema.Attribute{
@@ -71,6 +77,7 @@ func (b *Backend) ConfigSchema() *configschema.Block {
 				Description: "AWS region of the S3 Bucket and DynamoDB Table (if used).",
 			},
 			"endpoints": {
+				Optional: true,
 				NestedType: &configschema.Object{
 					Nesting: configschema.NestingSingle,
 					Attributes: map[string]*configschema.Attribute{
@@ -281,11 +288,6 @@ func (b *Backend) ConfigSchema() *configschema.Block {
 				Optional:    true,
 				Description: "The maximum number of times an AWS API request is retried on retryable failure.",
 			},
-			"use_legacy_workflow": {
-				Type:        cty.Bool,
-				Optional:    true,
-				Description: "Use the legacy authentication workflow, preferring environment variables over backend configuration.",
-			},
 			"custom_ca_bundle": {
 				Type:        cty.String,
 				Optional:    true,
@@ -302,6 +304,7 @@ func (b *Backend) ConfigSchema() *configschema.Block {
 				Description: "The endpoint mode of IMDS. Valid values: IPv4, IPv6.",
 			},
 			"assume_role": {
+				Optional: true,
 				NestedType: &configschema.Object{
 					Nesting: configschema.NestingSingle,
 					Attributes: map[string]*configschema.Attribute{
@@ -361,6 +364,7 @@ func (b *Backend) ConfigSchema() *configschema.Block {
 				},
 			},
 			"assume_role_with_web_identity": {
+				Optional: true,
 				NestedType: &configschema.Object{
 					Nesting: configschema.NestingSingle,
 					Attributes: map[string]*configschema.Attribute{
@@ -417,6 +421,17 @@ func (b *Backend) ConfigSchema() *configschema.Block {
 				Type:        cty.String,
 				Optional:    true,
 				Description: "The address of an HTTP proxy to use when accessing the AWS API.",
+			},
+			"https_proxy": {
+				Type:        cty.String,
+				Optional:    true,
+				Description: "The address of an HTTPS proxy to use when accessing the AWS API.",
+			},
+			"no_proxy": {
+				Type:     cty.String,
+				Optional: true,
+				Description: `Comma-separated values which specify hosts that should be excluded from proxying.
+See details: https://cs.opensource.google/go/x/net/+/refs/tags/v0.17.0:http/httpproxy/proxy.go;l=38-50.`,
 			},
 			"insecure": {
 				Type:        cty.Bool,
@@ -638,7 +653,7 @@ func (b *Backend) Configure(obj cty.Value) tfdiags.Diagnostics {
 	}
 
 	if region != "" && !boolAttr(obj, "skip_region_validation") {
-		if err := awsbase.ValidateRegion(region); err != nil {
+		if err := awsbaseValidation.SupportedRegion(region); err != nil {
 			diags = diags.Append(tfdiags.AttributeValue(
 				tfdiags.Error,
 				"Invalid region value",
@@ -713,10 +728,17 @@ func (b *Backend) Configure(obj cty.Value) tfdiags.Diagnostics {
 		StsEndpoint:             customEndpoints["sts"].String(obj),
 		StsRegion:               stringAttr(obj, "sts_region"),
 		Token:                   stringAttr(obj, "token"),
-		HTTPProxy:               stringAttrDefaultEnvVar(obj, "http_proxy", "HTTP_PROXY", "HTTPS_PROXY"),
-		Insecure:                boolAttr(obj, "insecure"),
-		UseDualStackEndpoint:    boolAttr(obj, "use_dualstack_endpoint"),
-		UseFIPSEndpoint:         boolAttr(obj, "use_fips_endpoint"),
+
+		// Note: we don't need to read env variables explicitly because they are read implicitly by aws-sdk-base-go:
+		// see: https://github.com/hashicorp/aws-sdk-go-base/blob/v2.0.0-beta.41/internal/config/config.go#L133
+		// which relies on: https://cs.opensource.google/go/x/net/+/refs/tags/v0.18.0:http/httpproxy/proxy.go;l=89-96
+		//
+		// Note: we are switching to "separate" mode here since the legacy mode is deprecated and should no longer be
+		// used.
+		HTTPProxyMode:        awsbase.HTTPProxyModeSeparate,
+		Insecure:             boolAttr(obj, "insecure"),
+		UseDualStackEndpoint: boolAttr(obj, "use_dualstack_endpoint"),
+		UseFIPSEndpoint:      boolAttr(obj, "use_fips_endpoint"),
 		UserAgent: awsbase.UserAgentProducts{
 			{Name: "APN", Version: "1.0"},
 			{Name: httpclient.DefaultApplicationName, Version: version.String()},
@@ -727,10 +749,14 @@ func (b *Backend) Configure(obj cty.Value) tfdiags.Diagnostics {
 		Logger:                         baselog,
 	}
 
-	if val, ok := boolAttrOk(obj, "use_legacy_workflow"); ok {
-		cfg.UseLegacyWorkflow = val
-	} else {
-		cfg.UseLegacyWorkflow = true
+	if val, ok := stringAttrOk(obj, "http_proxy"); ok {
+		cfg.HTTPProxy = &val
+	}
+	if val, ok := stringAttrOk(obj, "https_proxy"); ok {
+		cfg.HTTPSProxy = &val
+	}
+	if val, ok := stringAttrOk(obj, "no_proxy"); ok {
+		cfg.NoProxy = val
 	}
 
 	if val, ok := boolAttrOk(obj, "skip_metadata_api_check"); ok {
@@ -903,7 +929,7 @@ func configureAssumeRole(obj cty.Value) *awsbase.AssumeRole {
 	assumeRole := awsbase.AssumeRole{}
 
 	assumeRole.RoleARN = stringAttr(obj, "role_arn")
-	assumeRole.Duration = time.Duration(intAttr(obj, "assume_role_duration_seconds") * int(time.Second))
+	assumeRole.Duration = time.Duration(int64(intAttr(obj, "assume_role_duration_seconds")) * int64(time.Second))
 	assumeRole.ExternalID = stringAttr(obj, "external_id")
 	assumeRole.Policy = stringAttr(obj, "assume_role_policy")
 	assumeRole.SessionName = stringAttr(obj, "session_name")
@@ -1182,7 +1208,7 @@ func (e customEndpoint) String(obj cty.Value) string {
 	return v
 }
 
-func includeProtoIfNessesary(endpoint string) string {
+func includeProtoIfNecessary(endpoint string) string {
 	if matched, _ := regexp.MatchString("[a-z]*://.*", endpoint); !matched {
 		log.Printf("[DEBUG] Adding https:// prefix to endpoint '%s'", endpoint)
 		endpoint = fmt.Sprintf("https://%s", endpoint)
@@ -1197,12 +1223,12 @@ func (e customEndpoint) StringOk(obj cty.Value) (string, bool) {
 			continue
 		}
 		if s, ok := stringValueOk(val); ok {
-			return includeProtoIfNessesary(s), true
+			return includeProtoIfNecessary(s), true
 		}
 	}
 	for _, envVar := range e.EnvVars {
 		if v := os.Getenv(envVar); v != "" {
-			return includeProtoIfNessesary(v), true
+			return includeProtoIfNecessary(v), true
 		}
 	}
 	return "", false
