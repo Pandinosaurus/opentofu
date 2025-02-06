@@ -1,4 +1,6 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright (c) The OpenTofu Authors
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (c) 2023 HashiCorp, Inc.
 // SPDX-License-Identifier: MPL-2.0
 
 package s3
@@ -24,6 +26,7 @@ import (
 	types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	multierror "github.com/hashicorp/go-multierror"
 	uuid "github.com/hashicorp/go-uuid"
+
 	"github.com/opentofu/opentofu/internal/states/remote"
 	"github.com/opentofu/opentofu/internal/states/statemgr"
 )
@@ -117,6 +120,12 @@ func (c *RemoteClient) get(ctx context.Context) (*remote.Payload, error) {
 		Key:    &c.path,
 	}
 
+	if c.serverSideEncryption && c.customerEncryptionKey != nil {
+		inputHead.SSECustomerKey = aws.String(base64.StdEncoding.EncodeToString(c.customerEncryptionKey))
+		inputHead.SSECustomerAlgorithm = aws.String(s3EncryptionAlgorithm)
+		inputHead.SSECustomerKeyMD5 = aws.String(c.getSSECustomerKeyMD5())
+	}
+
 	// Head works around some s3 compatible backends not handling missing GetObject requests correctly (ex: minio Get returns Missing Bucket)
 	_, err = c.s3Client.HeadObject(ctx, inputHead)
 	if err != nil {
@@ -186,7 +195,7 @@ func (c *RemoteClient) Put(data []byte) error {
 
 	i := &s3.PutObjectInput{
 		ContentType:   &contentType,
-		ContentLength: contentLength,
+		ContentLength: aws.Int64(contentLength),
 		Body:          bytes.NewReader(data),
 		Bucket:        &c.bucketName,
 		Key:           &c.path,
@@ -397,6 +406,10 @@ func (c *RemoteClient) getLockInfo(ctx context.Context) (*statemgr.LockInfo, err
 		return nil, err
 	}
 
+	if len(resp.Item) == 0 {
+		return nil, fmt.Errorf("no lock info found for: %q within the DynamoDB table: %s", c.lockPath(), c.ddbTable)
+	}
+
 	var infoData string
 	if v, ok := resp.Item["Info"]; ok {
 		if v, ok := v.(*dtypes.AttributeValueMemberS); ok {
@@ -421,9 +434,6 @@ func (c *RemoteClient) Unlock(id string) error {
 	lockErr := &statemgr.LockError{}
 	ctx := context.TODO()
 
-	// TODO: store the path and lock ID in separate fields, and have proper
-	// projection expression only delete the lock if both match, rather than
-	// checking the ID from the info field first.
 	lockInfo, err := c.getLockInfo(ctx)
 	if err != nil {
 		lockErr.Err = fmt.Errorf("failed to retrieve lock info: %w", err)
@@ -436,11 +446,16 @@ func (c *RemoteClient) Unlock(id string) error {
 		return lockErr
 	}
 
+	// Use a condition expression to ensure both the lock info and lock ID match
 	params := &dynamodb.DeleteItemInput{
 		Key: map[string]dtypes.AttributeValue{
 			"LockID": &dtypes.AttributeValueMemberS{Value: c.lockPath()},
 		},
-		TableName: aws.String(c.ddbTable),
+		TableName:           aws.String(c.ddbTable),
+		ConditionExpression: aws.String("Info = :info"),
+		ExpressionAttributeValues: map[string]dtypes.AttributeValue{
+			":info": &dtypes.AttributeValueMemberS{Value: string(lockInfo.Marshal())},
+		},
 	}
 	_, err = c.dynClient.DeleteItem(ctx, params)
 
@@ -458,6 +473,10 @@ func (c *RemoteClient) lockPath() string {
 func (c *RemoteClient) getSSECustomerKeyMD5() string {
 	b := md5.Sum(c.customerEncryptionKey)
 	return base64.StdEncoding.EncodeToString(b[:])
+}
+
+func (c *RemoteClient) IsLockingEnabled() bool {
+	return c.ddbTable != ""
 }
 
 const errBadChecksumFmt = `state data in S3 does not have the expected content.

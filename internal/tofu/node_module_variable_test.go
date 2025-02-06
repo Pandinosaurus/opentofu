@@ -1,9 +1,12 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright (c) The OpenTofu Authors
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (c) 2023 HashiCorp, Inc.
 // SPDX-License-Identifier: MPL-2.0
 
 package tofu
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"testing"
@@ -218,7 +221,7 @@ func TestNodeModuleVariableConstraints(t *testing.T) {
 
 	t.Run("pass", func(t *testing.T) {
 		ctx := testContext2(t, ctxOpts)
-		plan, diags := ctx.Plan(m, states.NewState(), &PlanOpts{
+		plan, diags := ctx.Plan(context.Background(), m, states.NewState(), &PlanOpts{
 			Mode: plans.NormalMode,
 			SetVariables: InputValues{
 				"input": &InputValue{
@@ -239,7 +242,7 @@ func TestNodeModuleVariableConstraints(t *testing.T) {
 			}
 		}
 
-		state, diags := ctx.Apply(plan, m)
+		state, diags := ctx.Apply(context.Background(), plan, m)
 		assertNoDiagnostics(t, diags)
 		for _, addr := range checkableObjects {
 			result := state.CheckResults.GetObjectResult(addr)
@@ -251,7 +254,7 @@ func TestNodeModuleVariableConstraints(t *testing.T) {
 			}
 		}
 
-		plan, diags = ctx.Plan(m, state, &PlanOpts{
+		plan, diags = ctx.Plan(context.Background(), m, state, &PlanOpts{
 			Mode: plans.DestroyMode,
 			SetVariables: InputValues{
 				"input": &InputValue{
@@ -262,7 +265,7 @@ func TestNodeModuleVariableConstraints(t *testing.T) {
 		})
 		assertNoDiagnostics(t, diags)
 
-		state, diags = ctx.Apply(plan, m)
+		state, diags = ctx.Apply(context.Background(), plan, m)
 		assertNoDiagnostics(t, diags)
 		for _, addr := range checkableObjects {
 			result := state.CheckResults.GetObjectResult(addr)
@@ -277,7 +280,7 @@ func TestNodeModuleVariableConstraints(t *testing.T) {
 
 	t.Run("fail", func(t *testing.T) {
 		ctx := testContext2(t, ctxOpts)
-		_, diags := ctx.Plan(m, states.NewState(), &PlanOpts{
+		_, diags := ctx.Plan(context.Background(), m, states.NewState(), &PlanOpts{
 			Mode: plans.NormalMode,
 			SetVariables: InputValues{
 				"input": &InputValue{

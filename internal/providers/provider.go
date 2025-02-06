@@ -1,4 +1,6 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright (c) The OpenTofu Authors
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (c) 2023 HashiCorp, Inc.
 // SPDX-License-Identifier: MPL-2.0
 
 package providers
@@ -14,6 +16,11 @@ import (
 // Interface represents the set of methods required for a complete resource
 // provider plugin.
 type Interface interface {
+	// GetMetadata is not yet implemented or used at this time.  It may
+	// be used in the future to avoid loading a provider's full schema
+	// for initial validation.  This could result in some potential
+	// memory savings.
+
 	// GetSchema returns the complete schema for the provider.
 	GetProviderSchema() GetProviderSchemaResponse
 
@@ -67,8 +74,17 @@ type Interface interface {
 	// ImportResourceState requests that the given resource be imported.
 	ImportResourceState(ImportResourceStateRequest) ImportResourceStateResponse
 
+	MoveResourceState(MoveResourceStateRequest) MoveResourceStateResponse
+
 	// ReadDataSource returns the data source's current state.
 	ReadDataSource(ReadDataSourceRequest) ReadDataSourceResponse
+
+	// GetFunctions returns a full list of functions defined in this provider.  It should be a super
+	// set of the functions returned in GetProviderSchema()
+	GetFunctions() GetFunctionsResponse
+
+	// CallFunction requests that the given function is called and response returned.
+	CallFunction(CallFunctionRequest) CallFunctionResponse
 
 	// Close shuts down the plugin process if applicable.
 	Close() error
@@ -97,6 +113,9 @@ type GetProviderSchemaResponse struct {
 
 	// ServerCapabilities lists optional features supported by the provider.
 	ServerCapabilities ServerCapabilities
+
+	// Functions lists all functions supported by this provider.
+	Functions map[string]FunctionSpec
 }
 
 // Schema pairs a provider or resource schema with that schema's version.
@@ -123,8 +142,51 @@ type ServerCapabilities struct {
 	// provider does not require calling GetProviderSchema to operate
 	// normally, and the caller can used a cached copy of the provider's
 	// schema.
+	// In other words, the providers for which GetProviderSchemaOptional is false
+	// require their schema to be read after EVERY instantiation to function normally.
 	GetProviderSchemaOptional bool
 }
+
+type FunctionSpec struct {
+	// List of parameters required to call the function
+	Parameters []FunctionParameterSpec
+	// Optional Spec for variadic parameters
+	VariadicParameter *FunctionParameterSpec
+	// Type which the function will return
+	Return cty.Type
+	// Human-readable shortened documentation for the function
+	Summary string
+	// Human-readable documentation for the function
+	Description string
+	// Formatting type of the Description field
+	DescriptionFormat TextFormatting
+	// Human-readable message present if the function is deprecated
+	DeprecationMessage string
+}
+
+type FunctionParameterSpec struct {
+	// Human-readable display name for the parameter
+	Name string
+	// Type constraint for the parameter
+	Type cty.Type
+	// Null values allowed for the parameter
+	AllowNullValue bool
+	// Unknown Values allowed for the parameter
+	// Individual provider implementations may interpret this as a
+	// check using IsWhollyKnown instead cty's default of IsKnown.
+	// If the input is not wholly known, the result should be
+	// cty.UnknownVal(spec.returnType)
+	AllowUnknownValues bool
+	// Human-readable documentation for the parameter
+	Description string
+	// Formatting type of the Description field
+	DescriptionFormat TextFormatting
+}
+
+type TextFormatting string
+
+const TextFormattingPlain = TextFormatting("Plain")
+const TextFormattingMarkdown = TextFormatting("Markdown")
 
 type ValidateProviderConfigRequest struct {
 	// Config is the raw configuration value for the provider.
@@ -173,7 +235,7 @@ type UpgradeResourceStateRequest struct {
 	// Version is version of the schema that created the current state.
 	Version int64
 
-	// RawStateJSON and RawStateFlatmap contiain the state that needs to be
+	// RawStateJSON and RawStateFlatmap contain the state that needs to be
 	// upgraded to match the current schema version. Because the schema is
 	// unknown, this contains only the raw data as stored in the state.
 	// RawStateJSON is the current json state encoding.
@@ -396,6 +458,37 @@ func (ir ImportedResource) AsInstanceObject() *states.ResourceInstanceObject {
 	}
 }
 
+type MoveResourceStateRequest struct {
+	// The address of the provider the resource is being moved from.
+	SourceProviderAddress string
+	// The resource type that the resource is being moved from.
+	SourceTypeName string
+	// The schema version of the resource type that the resource is being
+	// moved from.
+	SourceSchemaVersion uint64
+	// The raw state of the resource being moved. Only the json field is
+	// populated, as there should be no legacy providers using the flatmap
+	// format that support newly introduced RPCs.
+	SourceStateJSON    []byte
+	SourceStateFlatmap map[string]string // Unused
+
+	// The private state of the resource being moved.
+	SourcePrivate []byte
+
+	// The resource type that the resource is being moved to.
+	TargetTypeName string
+}
+
+type MoveResourceStateResponse struct {
+	// The state of the resource after it has been moved.
+	TargetState cty.Value
+	// The private state of the resource after it has been moved.
+	TargetPrivate []byte
+
+	// Diagnostics contains any warnings or errors from the method call.
+	Diagnostics tfdiags.Diagnostics
+}
+
 type ReadDataSourceRequest struct {
 	// TypeName is the name of the data source type to Read.
 	TypeName string
@@ -416,4 +509,29 @@ type ReadDataSourceResponse struct {
 
 	// Diagnostics contains any warnings or errors from the method call.
 	Diagnostics tfdiags.Diagnostics
+}
+
+type GetFunctionsResponse struct {
+	Functions map[string]FunctionSpec
+
+	Diagnostics tfdiags.Diagnostics
+}
+
+type CallFunctionRequest struct {
+	Name      string
+	Arguments []cty.Value
+}
+
+type CallFunctionResponse struct {
+	Result cty.Value
+	Error  error
+}
+
+type CallFunctionArgumentError struct {
+	Text             string
+	FunctionArgument int
+}
+
+func (err *CallFunctionArgumentError) Error() string {
+	return err.Text
 }

@@ -1,4 +1,6 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright (c) The OpenTofu Authors
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (c) 2023 HashiCorp, Inc.
 // SPDX-License-Identifier: MPL-2.0
 
 package command
@@ -20,6 +22,7 @@ import (
 	"github.com/opentofu/opentofu/internal/command/arguments"
 	"github.com/opentofu/opentofu/internal/command/clistate"
 	"github.com/opentofu/opentofu/internal/command/views"
+	"github.com/opentofu/opentofu/internal/encryption"
 	"github.com/opentofu/opentofu/internal/states"
 	"github.com/opentofu/opentofu/internal/states/statemgr"
 	"github.com/opentofu/opentofu/internal/tofu"
@@ -250,7 +253,7 @@ func (m *Meta) backendMigrateState_S_s(opts *backendMigrateOpts) error {
 	// Copy the default state
 	opts.sourceWorkspace = currentWorkspace
 
-	// now switch back to the default env so we can acccess the new backend
+	// now switch back to the default env so we can access the new backend
 	m.SetWorkspace(backend.DefaultStateName)
 
 	return m.backendMigrateState_s_s(opts)
@@ -449,7 +452,7 @@ func (m *Meta) backendMigrateState_s_s(opts *backendMigrateOpts) error {
 	// The backend is currently handled before providers are installed during init,
 	// so requiring schemas here could lead to a catch-22 where it requires some manual
 	// intervention to proceed far enough for provider installation. To avoid this,
-	// when migrating to TFC backend, the initial JSON varient of state won't be generated and stored.
+	// when migrating to TFC backend, the initial JSON variant of state won't be generated and stored.
 	if err := destinationState.PersistState(nil); err != nil {
 		return fmt.Errorf(strings.TrimSpace(errBackendStateCopy),
 			opts.SourceType, opts.DestinationType, err)
@@ -495,8 +498,7 @@ func (m *Meta) backendMigrateNonEmptyConfirm(
 
 	// Helper to write the state
 	saveHelper := func(n, path string, s *states.State) error {
-		mgr := statemgr.NewFilesystem(path)
-		return mgr.WriteState(s)
+		return statemgr.WriteAndPersist(statemgr.NewFilesystem(path, encryption.StateEncryptionDisabled()), s, nil)
 	}
 
 	// Write the states
@@ -557,7 +559,7 @@ func (m *Meta) backendMigrateTFC(opts *backendMigrateOpts) error {
 	if err != nil {
 		return err
 	}
-	//to be used below, not yet implamented
+	// to be used below, not yet implemented
 	// destinationWorkspaces, destinationSingleState
 	_, _, err = retrieveWorkspaces(opts.Destination, opts.SourceType)
 	if err != nil {
@@ -653,7 +655,7 @@ func (m *Meta) backendMigrateTFC(opts *backendMigrateOpts) error {
 	}
 
 	// TODO(omar): after the check for sourceSingle is done, everything following
-	// it has to be multi. So rework the code to not need to check for multi, adn
+	// it has to be multi. So rework the code to not need to check for multi, and
 	// return m.backendMigrateState_S_TFC here.
 	return nil
 }
@@ -707,7 +709,7 @@ func (m *Meta) backendMigrateState_S_TFC(opts *backendMigrateOpts, sourceWorkspa
 	// * Specifically for a migration from the "remote" backend using 'prefix', we will
 	//   instead 'migrate' the workspaces using a pattern based on the old prefix+name,
 	//   not allowing a user to accidentally input the wrong pattern to line up with
-	//   what the the remote backend was already using before (which presumably already
+	//   what the remote backend was already using before (which presumably already
 	//   meets the naming considerations for Terraform Cloud).
 	//   In other words, this is a fast-track migration path from the remote backend, retaining
 	//   how things already are in Terraform Cloud with no user intervention needed.
